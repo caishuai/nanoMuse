@@ -18,7 +18,7 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import { stat } from 'node:fs/promises'
 import { join } from 'node:path'
-import { AGENTS, cliFor, home, readSession, type AgentId, type CodingSession } from './coding-readers.ts'
+import { AGENTS, cliFor, home, launchFor, readSession, type AgentId, type CodingSession } from './coding-readers.ts'
 
 export const RUN_TIMEOUT_MS = 20 * 60 * 1000
 /** Characters of agent text kept per run. */
@@ -108,14 +108,27 @@ export class Run {
   stop(): boolean {
     const p = this.process
     if (!p || p.exitCode !== null || p.signalCode !== null || !p.pid) return false
-    try {
-      if (process.platform !== 'win32') process.kill(-p.pid, 'SIGTERM')
-      else p.kill()
-    } catch {
-      return false
-    }
+    if (!killTree(p, 'SIGTERM')) return false
     this.status = 'stopped'
     return true
+  }
+}
+
+/**
+ * End a run's whole tree. On Windows a batch shim runs as `cmd.exe` with the CLI under it, and
+ * killing the one would leave the other going, so the tree goes with `taskkill /t`.
+ */
+function killTree(p: ChildProcess, signal: NodeJS.Signals): boolean {
+  try {
+    if (process.platform !== 'win32') {
+      if (p.pid) process.kill(-p.pid, signal)
+      return true
+    }
+    if (!p.pid) return false
+    spawn('taskkill', ['/pid', String(p.pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true })
+    return true
+  } catch {
+    return false
   }
 }
 
@@ -511,12 +524,7 @@ async function waitExit(p: ChildProcess, graceMs: number): Promise<void> {
   let deadline = Date.now() + graceMs
   while (!exited(p) && Date.now() < deadline) await sleep(100)
   if (!exited(p)) {
-    try {
-      if (process.platform !== 'win32' && p.pid) process.kill(-p.pid, 'SIGKILL')
-      else p.kill('SIGKILL')
-    } catch {
-      // already gone
-    }
+    killTree(p, 'SIGKILL')
     deadline = Date.now() + 5000
     while (!exited(p) && Date.now() < deadline) await sleep(100)
   }
@@ -581,14 +589,16 @@ export async function startRun(options: StartOptions): Promise<Run> {
       return run
     }
     const [file, ...args] = commandFor(agent, cli, sessionId, run.workspace, attemptText, resume)
+    const launch = launchFor(file as string, args, process.platform, options.env ?? process.env)
     let proc: ChildProcess
     try {
-      proc = spawn(file as string, args, {
+      proc = spawn(launch.file, launch.args, {
         cwd: run.workspace || undefined,
         stdio: ['ignore', 'pipe', 'pipe'],
         detached: process.platform !== 'win32',
         env: agentEnv(agent, options.env ?? process.env),
         windowsHide: true,
+        windowsVerbatimArguments: launch.windowsVerbatimArguments,
       })
     } catch (error: unknown) {
       finish('failed', error instanceof Error ? error.message : String(error))

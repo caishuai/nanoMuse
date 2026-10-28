@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { test } from 'node:test'
 import { zstdCompressSync } from 'node:zlib'
-import { cliFor, clean, countProcesses, detect, ownDshEntry, parsePs, parseTasklist, readSession, sessions, sessionsRoot, slugToPath, title, which } from '../lib/coding-readers.js'
+import { cliFor, clean, countProcesses, detect, launchFor, ownDshEntry, parsePs, parseTasklist, readSession, sessions, sessionsRoot, slugToPath, title, which } from '../lib/coding-readers.js'
 import { agentEnv, commandFor, continuation, normalise, Run, runFromView, startRun } from '../lib/coding-runner.js'
 import { CODING_ACTIONS, CodingService, codingBrief, GATED_CODING_ACTIONS } from '../lib/coding.js'
 
@@ -637,4 +637,56 @@ test('service: another computer’s agents through the hub, and a remote send fo
   assert.equal(done.device, 'Studio')
   assert.ok(bus.every((m) => m.device === 'Studio'))
   assert.deepEqual(hub.calls[hub.calls.length - 1].args, { agent: 'codex', text: 'build it', wait: true })
+})
+
+test('readers: a Windows CLI is its PATHEXT program, never the POSIX shim beside it', async () => {
+  await scratch(async (dir) => {
+    const bin = join(dir, 'bin')
+    await mkdir(bin)
+    // what npm writes for a global CLI: a shell script, then the start Windows uses
+    await writeFile(join(bin, 'codex'), '#!/bin/sh\n')
+    await writeFile(join(bin, 'codex.CMD'), '@ECHO off\r\n')
+    const env = { PATH: bin }
+    assert.equal(which('codex', env, 'win32'), join(bin, 'codex.CMD'), 'the shim answered spawn ENOENT')
+    assert.equal(which('codex', env, 'linux'), join(bin, 'codex'), 'elsewhere the bare name is the program')
+    await rm(join(bin, 'codex.CMD'))
+    assert.equal(which('codex', env, 'win32'), undefined, 'a shim alone is not a CLI Windows can start')
+  })
+})
+
+test('runner: a batch CLI goes through ComSpec with every argument quoted', () => {
+  assert.deepEqual(launchFor('/usr/local/bin/codex', ['exec', 'hi'], 'linux'), { file: '/usr/local/bin/codex', args: ['exec', 'hi'] })
+  // a real program is started as it is, extension or not
+  assert.deepEqual(launchFor('C:\\npm\\codex.exe', ['exec'], 'win32'), { file: 'C:\\npm\\codex.exe', args: ['exec'] })
+  const batch = launchFor('C:\\npm\\codex.cmd', ['exec', 'a b', 'say "hi"'], 'win32', { ComSpec: 'C:\\Windows\\System32\\cmd.exe' })
+  assert.equal(batch.file, 'C:\\Windows\\System32\\cmd.exe')
+  assert.equal(batch.windowsVerbatimArguments, true)
+  assert.deepEqual(batch.args.slice(0, 3), ['/d', '/s', '/c'])
+  // the extra outer pair is what `cmd /s /c` needs when the program itself is quoted
+  assert.equal(batch.args[3], '""C:\\npm\\codex.cmd" "exec" "a b" "say \\"hi\\"""')
+})
+
+test('runner: a .cmd CLI on Windows starts and its message arrives whole', { skip: posix }, async () => {
+  await scratch(async (dir) => {
+    const script = join(dir, 'fake-claude.mjs')
+    await writeFile(
+      script,
+      `
+const args = process.argv.slice(2)
+const text = args[args.length - 1]
+const out = (o) => process.stdout.write(JSON.stringify(o) + '\\n')
+out({ type: 'system', subtype: 'init', session_id: 'cmd-1', model: 'fake' })
+out({ type: 'assistant', message: { content: [{ type: 'text', text: 'You said: ' + text }] } })
+out({ type: 'result', result: 'You said: ' + text, session_id: 'cmd-1' })
+`,
+    )
+    // the shape npm gives a global CLI on Windows, beside the script it runs
+    const cli = join(dir, 'claude.cmd')
+    await writeFile(cli, `@ECHO off\r\n"${process.execPath}" "%~dp0fake-claude.mjs" %*\r\n`)
+    const asked = 'say "hi" 和中文 with spaces'
+    const run = await startRun({ agent: 'claude', text: asked, which: () => cli, timeoutMs: 30_000, readerEnv: { NANOMUSE_CODING_HOME: join(dir, 'nohome') } })
+    assert.equal(run.status, 'done', run.error)
+    assert.equal(run.output, `You said: ${asked}`, 'a quote or a space in the message must survive the command processor')
+    assert.equal(run.result_session_id, 'cmd-1')
+  })
 })

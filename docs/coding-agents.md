@@ -42,6 +42,16 @@ phone never does.
 | Claude Code | `~/.claude/projects/<workspace-slug>/<id>.jsonl` | `claude -p --output-format stream-json --verbose --permission-mode acceptEdits [--resume <id>] "<text>"` |
 | dsh (DeepSeek Harness) | `~/.dsh/sessions/<workspace-slug>/<id>/session.v4.jsonl.zstd` | `dsh --profile headless --json [--session-id <id>] "<text>"` |
 
+**How the CLI is found and started.** A run uses the first of the agent's
+programs on `PATH`. On Windows that is a `PATHEXT` name (`.exe` before
+`.cmd`), never the extension-less shell script npm writes beside it, because
+Windows cannot start one and the run would fail with `spawn … ENOENT`. A
+`.cmd` or `.bat` goes through `cmd.exe` with every argument quoted, so a
+message keeps its quotes, its spaces and its Chinese; `%NAME%` in a message is
+expanded by the command processor there, as it is for any batch program.
+Stopping a run ends its whole process tree, not only the command processor
+above it.
+
 Reading is best effort: a line that does not parse is skipped, a missing
 directory is an agent with no sessions. The `~` is the user's home unless
 `NANOMUSE_CODING_HOME` names another directory (a container that mounts the

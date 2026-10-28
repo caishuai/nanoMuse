@@ -141,10 +141,14 @@ export function ownDshEntry(argv: readonly string[] = process.argv): string | un
 /** The first of the agent's executables on PATH (PATHEXT on Windows), or undefined. */
 export function which(agent: AgentId, env: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform): string | undefined {
   const dirs = (env.PATH ?? env.Path ?? '').split(delimiter).filter(Boolean)
+  // On Windows a name without an extension is never a program: npm writes the CLI's POSIX shim
+  // (`codex`, a shell script) beside the one Windows starts (`codex.cmd`), and a run that took
+  // the shim answered `spawn … ENOENT`. Only the PATHEXT names are candidates there; elsewhere
+  // the bare name is the program.
   const exts = platform === 'win32' ? (env.PATHEXT ?? '.EXE;.CMD;.BAT;.COM').split(';').filter(Boolean) : ['']
   for (const bin of AGENTS[agent].bins) {
     for (const dir of dirs) {
-      for (const ext of [''].concat(platform === 'win32' ? exts : [])) {
+      for (const ext of exts) {
         const candidate = join(dir, bin + ext)
         try {
           if (statSync(candidate).isFile()) return candidate
@@ -155,6 +159,43 @@ export function which(agent: AgentId, env: NodeJS.ProcessEnv = process.env, plat
     }
   }
   return undefined
+}
+
+/** How a CLI is started: the program, its arguments, and whether they are passed through as written. */
+export interface Launch {
+  file: string
+  args: string[]
+  windowsVerbatimArguments?: boolean
+}
+
+/**
+ * One argument as `cmd.exe` needs it: quoted, with its own quotes escaped for the program's
+ * parser. `cmd` reads `%NAME%` as a variable even inside quotes, so a message that names one
+ * arrives expanded, which is how a batch shim has always behaved.
+ */
+function cmdArg(value: string): string {
+  return `"${value.replace(/"/g, '\\"')}"`
+}
+
+/**
+ * The invocation to start for a resolved CLI. A `.cmd` or `.bat` on Windows is a script for the
+ * command processor rather than a program, and Node refuses to start one directly (EINVAL), so
+ * it goes through `ComSpec`. The line carries one extra pair of quotes, the shape `cmd /s /c`
+ * needs when the thing it runs is itself quoted: `""C:\…\codex.cmd" "exec" "…""`.
+ */
+export function launchFor(
+  file: string,
+  args: readonly string[],
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+): Launch {
+  if (platform !== 'win32' || !/\.(cmd|bat)$/i.test(file)) return { file, args: [...args] }
+  const line = [file, ...args].map(cmdArg).join(' ')
+  return {
+    file: env.ComSpec || env.COMSPEC || 'cmd.exe',
+    args: ['/d', '/s', '/c', `"${line}"`],
+    windowsVerbatimArguments: true,
+  }
 }
 
 /**
@@ -168,12 +209,18 @@ export function cliFor(agent: AgentId, env: NodeJS.ProcessEnv = process.env, arg
 
 /** The first line of `<cli> --version`, at most 60 characters; empty when it cannot be run. */
 export function versionOf(cli: string, timeoutMs = 8000): Promise<string> {
+  const launch = launchFor(cli, ['--version'])
   return new Promise((done) => {
     try {
-      execFile(cli, ['--version'], { timeout: timeoutMs, windowsHide: true, maxBuffer: 64 * 1024 }, (error, stdout, stderr) => {
-        const text = String(stdout || stderr || '').trim().split(/\r?\n/)[0] ?? ''
-        done(error && !text ? '' : text.slice(0, 60))
-      })
+      execFile(
+        launch.file,
+        launch.args,
+        { timeout: timeoutMs, windowsHide: true, maxBuffer: 64 * 1024, windowsVerbatimArguments: launch.windowsVerbatimArguments },
+        (error, stdout, stderr) => {
+          const text = String(stdout || stderr || '').trim().split(/\r?\n/)[0] ?? ''
+          done(error && !text ? '' : text.slice(0, 60))
+        },
+      )
     } catch {
       done('')
     }
