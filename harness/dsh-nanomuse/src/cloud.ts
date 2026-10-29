@@ -818,11 +818,14 @@ export default class NanomuseCloud extends Service {
       this.ctx.logger.warn('nanomuse cloud: no loopback door to the relay (%s); calls go direct, without their provenance', message(error))
     }
     this.ctx.effect(() => () => void this.relayDoor.close(), 'nanomuse cloud: relay door')
-    try {
-      await this.repointProvider()
-    } catch (error: unknown) {
+    // The row is re-pointed without holding this start up. A settings row is written through the
+    // same store the loader's settle waits on, and this start used to await that answer: the
+    // settle never came, and because it is awaited inside a `.catch(() => {})` not a word was
+    // printed, so the desk looked simply stuck. The write still runs, its failures still logged,
+    // and the door is open before it.
+    void this.repointProvider().catch((error: unknown) => {
       this.ctx.logger.warn('nanomuse cloud: could not point the provider row at the relay door: %s', message(error))
-    }
+    })
     this.provenance.hands((sessionId) => this.handsOf(sessionId))
     this.catalogue = await loadCatalogue()
     if (!this.catalogue.length) this.ctx.logger.warn('nanomuse: assets/providers.json missing or empty; the own-key step lists nothing')
