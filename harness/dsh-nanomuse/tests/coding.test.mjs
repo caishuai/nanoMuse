@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { test } from 'node:test'
 import { zstdCompressSync } from 'node:zlib'
-import { cliFor, clean, countProcesses, detect, launchFor, ownDshEntry, parsePs, parseTasklist, readSession, sessions, sessionsRoot, slugToPath, title, which } from '../lib/coding-readers.js'
+import { cliFor, clean, countProcesses, detect, launchFor, ownDshEntry, parsePs, parseTasklist, readSession, sessions, sessionsRoot, slugToPath, title, versionOf, which } from '../lib/coding-readers.js'
 import { agentEnv, commandFor, continuation, normalise, Run, runFromView, startRun } from '../lib/coding-runner.js'
 import { CODING_ACTIONS, CodingService, codingBrief, GATED_CODING_ACTIONS } from '../lib/coding.js'
 
@@ -229,6 +229,47 @@ test('readers: detect sees a store without a CLI, and a CLI on PATH', { skip: !p
     assert.equal(claude.installed, true, 'a store on disk counts as installed')
     assert.equal(claude.cli, null)
     assert.equal(claude.version, '')
+  })
+})
+
+// A Windows CLI from npm is `cmd.exe` over the real program, and `execFile` answers only once
+// every holder of the pipes has gone — a program that printed its version and stayed up kept
+// the promise waiting forever (and the loader, whose settle is awaited in a swallowed catch).
+
+/**
+ * A fake CLI that prints `version` — or nothing — and then stays up thirty seconds: on Windows
+ * a `.cmd`, which is what npm writes and what `launchFor` sends through `cmd.exe`.
+ */
+async function hangingCli(dir, version) {
+  if (posix) {
+    const cli = join(dir, 'codex')
+    await writeFile(cli, '#!/bin/sh\n' + (version ? `echo "${version}"\n` : '') + 'exec sleep 30\n')
+    await chmod(cli, 0o755)
+    return cli
+  }
+  const cli = join(dir, 'codex.cmd')
+  const lines = ['@echo off']
+  if (version) lines.push(`echo ${version}`)
+  lines.push('ping -n 31 127.0.0.1 >nul')
+  await writeFile(cli, lines.join('\r\n') + '\r\n')
+  return cli
+}
+
+test('readers: a version is read without waiting for the program to end', async () => {
+  await scratch(async (dir) => {
+    const cli = await hangingCli(dir, 'codex-cli 0.42.0')
+    const started = Date.now()
+    assert.equal(await versionOf(cli, 5000), 'codex-cli 0.42.0')
+    assert.ok(Date.now() - started < 3000, 'the line is taken as it arrives, not at the exit')
+  })
+})
+
+test('readers: a version probe ends even when nothing answers', async () => {
+  await scratch(async (dir) => {
+    const cli = await hangingCli(dir, '')
+    const started = Date.now()
+    assert.equal(await versionOf(cli, 300), '')
+    assert.ok(Date.now() - started < 2500, 'our own clock ends it')
   })
 })
 

@@ -22,7 +22,7 @@
  * missing directory is an agent with no sessions. `~` is the user's home unless
  * `NANOMUSE_CODING_HOME` names another directory.
  */
-import { execFile } from 'node:child_process'
+import { spawn, type ChildProcess } from 'node:child_process'
 import { existsSync, statSync } from 'node:fs'
 import { open, readdir, readFile, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
@@ -207,23 +207,90 @@ export function cliFor(agent: AgentId, env: NodeJS.ProcessEnv = process.env, arg
   return which(agent, env) ?? (agent === 'dsh' ? ownDshEntry(argv) : undefined)
 }
 
-/** The first line of `<cli> --version`, at most 60 characters; empty when it cannot be run. */
-export function versionOf(cli: string, timeoutMs = 8000): Promise<string> {
-  const launch = launchFor(cli, ['--version'])
+/** What a probe printed, and nothing else: `out` is its standard output, `err` its errors. */
+interface ProbeOutput {
+  out: string
+  err: string
+}
+
+/** The most one probe keeps, so a program that cannot stop printing cannot take the memory. */
+const PROBE_CAP = 16 * 1024 * 1024
+
+/**
+ * Start something and read what it prints, giving up on our own clock.
+ *
+ * Not `execFile`: it answers only when the child *and every process still holding its pipes*
+ * have gone. A CLI npm installed on Windows is `cmd.exe` with the real program under it, and
+ * `execFile`'s `timeout` ends only the `cmd.exe` it started — the program stays up holding the
+ * pipes, the callback never comes, and whoever awaited it waits forever. Upstream the loader's
+ * settle is awaited inside a `.catch(() => {})`, so nothing is even printed when that happens.
+ * Here the program is started with its own timer: the output is taken as it arrives, `ready`
+ * may take it early, and the whole tree is ended either way.
+ */
+function probeUntil(launch: Launch, timeoutMs: number, ready: (answer: ProbeOutput) => boolean): Promise<ProbeOutput> {
   return new Promise((done) => {
+    const answer: ProbeOutput = { out: '', err: '' }
+    let child: ChildProcess
     try {
-      execFile(
-        launch.file,
-        launch.args,
-        { timeout: timeoutMs, windowsHide: true, maxBuffer: 64 * 1024, windowsVerbatimArguments: launch.windowsVerbatimArguments },
-        (error, stdout, stderr) => {
-          const text = String(stdout || stderr || '').trim().split(/\r?\n/)[0] ?? ''
-          done(error && !text ? '' : text.slice(0, 60))
-        },
-      )
+      child = spawn(launch.file, launch.args, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+        windowsVerbatimArguments: launch.windowsVerbatimArguments,
+      })
     } catch {
-      done('')
+      done(answer)
+      return
     }
+    let timer: NodeJS.Timeout | undefined
+    let settled = false
+    const finish = (): void => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      child.stdout?.destroy()
+      child.stderr?.destroy()
+      if (child.pid !== undefined) killProbe(child.pid)
+      done(answer)
+    }
+    timer = setTimeout(finish, timeoutMs)
+    child.stdout?.on('data', (chunk: Buffer) => {
+      if (settled) return
+      answer.out += chunk.toString('utf8')
+      if (ready(answer)) finish()
+    })
+    child.stderr?.on('data', (chunk: Buffer) => {
+      if (settled) return
+      answer.err += chunk.toString('utf8')
+      if (ready(answer)) finish()
+    })
+    child.on('error', finish)
+    child.on('close', finish)
+  })
+}
+
+/** End a probe and everything it started, so no CLI is left running behind it. */
+function killProbe(pid: number): void {
+  try {
+    if (process.platform === 'win32') {
+      spawn('taskkill', ['/pid', String(pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true }).on('error', () => undefined)
+      return
+    }
+    process.kill(pid, 'SIGKILL')
+  } catch {
+    // already gone
+  }
+}
+
+/**
+ * The first line of `<cli> --version`, at most 60 characters; empty when it cannot be run.
+ * Settles once there is a line to read, or after eight seconds whichever comes first: never
+ * held to the end by a program that printed its version and stayed up.
+ */
+export function versionOf(cli: string, timeoutMs = 8000): Promise<string> {
+  const firstLine = (r: ProbeOutput) => /[\r\n]/.test(r.out) || /[\r\n]/.test(r.err)
+  return probeUntil(launchFor(cli, ['--version']), timeoutMs, firstLine).then(({ out, err }) => {
+    const text = String(out || err || '').trim().split(/\r?\n/)[0] ?? ''
+    return text.slice(0, 60)
   })
 }
 
@@ -306,14 +373,10 @@ async function linuxRows(): Promise<ProcessRow[]> {
   return out
 }
 
+/** `stdout` of one command, read the same way a version is: never past `timeoutMs`. */
 function runText(file: string, args: string[], timeoutMs: number): Promise<string> {
-  return new Promise((done) => {
-    try {
-      execFile(file, args, { timeout: timeoutMs, windowsHide: true, maxBuffer: 16 * 1024 * 1024 }, (_error, stdout) => done(String(stdout ?? '')))
-    } catch {
-      done('')
-    }
-  })
+  const full = (r: ProbeOutput) => r.out.length >= PROBE_CAP
+  return probeUntil(launchFor(file, args), timeoutMs, full).then(({ out }) => out)
 }
 
 /** The command lines of the node.exe processes (tasklist has none); one PowerShell call. */
